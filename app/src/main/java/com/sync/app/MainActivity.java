@@ -1,17 +1,21 @@
 package com.sync.app;
 
 import android.annotation.SuppressLint;
+import android.app.Notification;
+import android.app.NotificationChannel;
 import android.app.NotificationManager;
-import android.content.ComponentName;
-import android.content.Context;
+import android.app.PendingIntent;
 import android.content.Intent;
-import android.content.ServiceConnection;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.IBinder;
+import android.support.v4.media.MediaMetadataCompat;
+import android.support.v4.media.session.MediaSessionCompat;
+import android.support.v4.media.session.PlaybackStateCompat;
 import android.util.Base64;
 import android.util.Log;
 import android.view.View;
@@ -24,9 +28,12 @@ import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
+import androidx.core.app.NotificationCompat;
 import androidx.core.content.ContextCompat;
+import androidx.media.app.NotificationCompat.MediaStyle;
 import androidx.webkit.WebViewAssetLoader;
 
 import org.json.JSONArray;
@@ -34,6 +41,9 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -53,55 +63,41 @@ import okhttp3.Response;
 
 public class MainActivity extends AppCompatActivity {
 
-    private static final String TAG = "SYNC";
-    private WebView webView;
-    private WebViewAssetLoader assetLoader;
+    private static final String TAG        = "SYNC";
+    private static final String CHANNEL_ID = "sync_playback";
+    private static final int    NOTIF_ID   = 1001;
 
-    private final OkHttpClient http = new OkHttpClient.Builder()
-            .followRedirects(true)
-            .build();
-    private final ExecutorService executor = Executors.newFixedThreadPool(4);
+    // 알림 액션
+    private static final String ACT_PLAY  = "SYNC_PLAY";
+    private static final String ACT_PAUSE = "SYNC_PAUSE";
+    private static final String ACT_NEXT  = "SYNC_NEXT";
+    private static final String ACT_PREV  = "SYNC_PREV";
 
-    // ── 백그라운드 재생 ──
-    private MusicService musicService;
-    private boolean serviceBound = false;
+    private WebView             webView;
+    private WebViewAssetLoader  assetLoader;
+    private MediaSessionCompat  mediaSession;
+    private NotificationManager notifMgr;
 
-    private final ServiceConnection serviceConn = new ServiceConnection() {
-        @Override
-        public void onServiceConnected(ComponentName name, IBinder binder) {
-            MusicService.LocalBinder lb = (MusicService.LocalBinder) binder;
-            musicService = lb.getService();
-            serviceBound  = true;
-            musicService.setCallback(new MusicService.ServiceCallback() {
-                @Override public void onPlay()  {
-                    runOnUiThread(() ->
-                        webView.evaluateJavascript("togglePlay()", null));
-                }
-                @Override public void onPause() {
-                    runOnUiThread(() ->
-                        webView.evaluateJavascript("togglePlay()", null));
-                }
-                @Override public void onNext()  {
-                    runOnUiThread(() ->
-                        webView.evaluateJavascript("nextT()", null));
-                }
-                @Override public void onPrev()  {
-                    runOnUiThread(() ->
-                        webView.evaluateJavascript("prevT()", null));
-                }
-            });
-        }
-        @Override
-        public void onServiceDisconnected(ComponentName name) {
-            serviceBound = false;
-        }
-    };
+    private final OkHttpClient   http     = new OkHttpClient.Builder().followRedirects(true).build();
+    private final ExecutorService executor = Executors.newFixedThreadPool(6);
 
+    // 현재 트랙 상태
+    private String  curTitle   = "";
+    private String  curArtist  = "";
+    private String  curThumb   = "";
+    private boolean curPlaying = false;
+    private long    curDurMs   = 0;
+    private long    curPosMs   = 0;
+
+    // ════════════════════════════════════════════════════
+    //  onCreate
+    // ════════════════════════════════════════════════════
     @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        // 시스템 바 투명
         getWindow().setStatusBarColor(Color.TRANSPARENT);
         getWindow().setNavigationBarColor(Color.TRANSPARENT);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -117,13 +113,13 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
         webView = findViewById(R.id.webView);
 
+        // AssetLoader
         assetLoader = new WebViewAssetLoader.Builder()
-                .addPathHandler("/assets/",
-                        new WebViewAssetLoader.AssetsPathHandler(this))
-                .addPathHandler("/res/",
-                        new WebViewAssetLoader.ResourcesPathHandler(this))
+                .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
+                .addPathHandler("/res/",    new WebViewAssetLoader.ResourcesPathHandler(this))
                 .build();
 
+        // WebSettings
         WebSettings ws = webView.getSettings();
         ws.setJavaScriptEnabled(true);
         ws.setDomStorageEnabled(true);
@@ -144,49 +140,65 @@ public class MainActivity extends AppCompatActivity {
 
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         webView.setBackgroundColor(Color.parseColor("#08080D"));
-
         webView.addJavascriptInterface(new AndroidBridge(), "AndroidBridge");
         webView.setWebChromeClient(new WebChromeClient());
-
         webView.setWebViewClient(new WebViewClient() {
             @Override
-            public WebResourceResponse shouldInterceptRequest(
-                    WebView view, WebResourceRequest request) {
-                WebResourceResponse response =
-                        assetLoader.shouldInterceptRequest(request.getUrl());
-                if (response == null) return null;
-                String mime = response.getMimeType();
+            public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                WebResourceResponse res = assetLoader.shouldInterceptRequest(r.getUrl());
+                if (res == null) return null;
+                String mime = res.getMimeType();
                 if (mime == null) mime = "text/plain";
                 if (mime.contains(";")) mime = mime.substring(0, mime.indexOf(";")).trim();
-                return new WebResourceResponse(mime, "UTF-8", response.getData());
+                return new WebResourceResponse(mime, "UTF-8", res.getData());
             }
-
             @Override
-            public boolean shouldOverrideUrlLoading(
-                    WebView view, WebResourceRequest request) {
-                return false;
-            }
+            public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) { return false; }
         });
 
-        // 알림 권한 요청 (Android 13+)
+        // 알림 권한 (Android 13+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this,
                     android.Manifest.permission.POST_NOTIFICATIONS)
                     != PackageManager.PERMISSION_GRANTED) {
                 ActivityCompat.requestPermissions(this,
-                    new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 1);
+                        new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 1);
             }
         }
 
-        // 서비스 시작 & 바인드
-        Intent serviceIntent = new Intent(this, MusicService.class);
-        ContextCompat.startForegroundService(this, serviceIntent);
-        bindService(serviceIntent, serviceConn, Context.BIND_AUTO_CREATE);
+        notifMgr = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        createNotifChannel();
+        initMediaSession();
 
-        webView.loadUrl(
-                "https://appassets.androidplatform.net/assets/www/index.html");
+        webView.loadUrl("https://appassets.androidplatform.net/assets/www/index.html");
     }
 
+    // ════════════════════════════════════════════════════
+    //  MediaSession
+    // ════════════════════════════════════════════════════
+    private void initMediaSession() {
+        mediaSession = new MediaSessionCompat(this, "SYNC");
+        mediaSession.setFlags(
+                MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS |
+                MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS);
+
+        mediaSession.setCallback(new MediaSessionCompat.Callback() {
+            @Override public void onPlay()           { jsCall("togglePlay()"); }
+            @Override public void onPause()          { jsCall("togglePlay()"); }
+            @Override public void onSkipToNext()     { jsCall("nextT()"); }
+            @Override public void onSkipToPrevious() { jsCall("prevT()"); }
+            @Override public void onSeekTo(long pos) {
+                jsCall("if(S.ytPlayer&&S.ytReady)S.ytPlayer.seekTo(" + (pos / 1000.0) + ",true)");
+            }
+        });
+
+        updatePbState(PlaybackStateCompat.STATE_NONE, 0);
+        mediaSession.setActive(true);
+    }
+
+    // ════════════════════════════════════════════════════
+    //  JS → Java 브릿지
+    // ════════════════════════════════════════════════════
     public class AndroidBridge {
         @JavascriptInterface
         public void postMessage(String json) {
@@ -194,80 +206,196 @@ public class MainActivity extends AppCompatActivity {
                 JSONObject msg = new JSONObject(json);
                 String type = msg.optString("type");
                 switch (type) {
+
                     case "search":
                         executor.submit(() -> doSearch(msg));
                         break;
+
                     case "suggest":
                         executor.submit(() -> doSuggest(msg));
                         break;
+
                     case "fetchLyrics":
                         executor.submit(() -> doFetchLyrics(msg));
                         break;
+
                     case "orientation":
-                        String orient = msg.optString("value", "sensor");
-                        runOnUiThread(() -> setOrientation(orient));
+                        String o = msg.optString("value", "sensor");
+                        runOnUiThread(() -> setOrientation(o));
                         break;
 
-                    // ── 백그라운드 재생: 트랙 전체 정보 ──
+                    // ── 트랙 변경 ──
                     case "trackInfo":
-                        String title   = msg.optString("title",  "");
-                        String artist  = msg.optString("artist", "");
-                        String thumb   = msg.optString("thumb",  "");
-                        boolean playing = msg.optBoolean("playing", false);
-                        long durMs     = (long)(msg.optDouble("duration", 0) * 1000);
-                        if (serviceBound && musicService != null) {
-                            musicService.updateTrack(title, artist, thumb, playing, durMs);
-                        }
+                        curTitle   = msg.optString("title",  "");
+                        curArtist  = msg.optString("artist", "");
+                        curThumb   = msg.optString("thumb",  "");
+                        curPlaying = msg.optBoolean("playing", false);
+                        curDurMs   = (long)(msg.optDouble("duration", 0) * 1000);
+                        executor.submit(() -> refreshNotif(loadBitmap(curThumb)));
                         break;
 
-                    // ── 백그라운드 재생: 재생/일시정지 상태 ──
+                    // ── 재생 / 일시정지 ──
                     case "playState":
-                        boolean pl = msg.optBoolean("playing", false);
-                        if (serviceBound && musicService != null) {
-                            musicService.setPlaying(pl);
-                        }
+                        curPlaying = msg.optBoolean("playing", false);
+                        updatePbState(
+                            curPlaying ? PlaybackStateCompat.STATE_PLAYING
+                                       : PlaybackStateCompat.STATE_PAUSED,
+                            curPosMs);
+                        executor.submit(() -> refreshNotif(loadBitmap(curThumb)));
                         break;
 
-                    // ── 백그라운드 재생: 현재 위치 ──
+                    // ── 재생 위치 ──
                     case "seekPosition":
-                        long posMs = (long)(msg.optDouble("position", 0) * 1000);
-                        if (serviceBound && musicService != null) {
-                            musicService.updatePosition(posMs);
-                        }
+                        curPosMs = (long)(msg.optDouble("position", 0) * 1000);
+                        updatePbState(
+                            curPlaying ? PlaybackStateCompat.STATE_PLAYING
+                                       : PlaybackStateCompat.STATE_PAUSED,
+                            curPosMs);
                         break;
 
-                    default:
-                        break;
+                    default: break;
                 }
             } catch (JSONException e) {
-                Log.e(TAG, "postMessage parse error", e);
+                Log.e(TAG, "bridge error", e);
             }
         }
     }
 
+    // ════════════════════════════════════════════════════
+    //  알림
+    // ════════════════════════════════════════════════════
+    private void createNotifChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel ch = new NotificationChannel(
+                    CHANNEL_ID, "SYNC 음악 재생", NotificationManager.IMPORTANCE_LOW);
+            ch.setDescription("백그라운드 음악 재생");
+            ch.setShowBadge(false);
+            notifMgr.createNotificationChannel(ch);
+        }
+    }
+
+    private void refreshNotif(Bitmap thumb) {
+        updateMediaMeta(thumb);
+        notifMgr.notify(NOTIF_ID, buildNotif(thumb));
+    }
+
+    private void updateMediaMeta(Bitmap thumb) {
+        MediaMetadataCompat.Builder b = new MediaMetadataCompat.Builder()
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE,  curTitle)
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, curArtist)
+                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, curDurMs);
+        if (thumb != null)
+            b.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, thumb);
+        mediaSession.setMetadata(b.build());
+    }
+
+    private void updatePbState(int state, long pos) {
+        mediaSession.setPlaybackState(new PlaybackStateCompat.Builder()
+                .setActions(
+                        PlaybackStateCompat.ACTION_PLAY |
+                        PlaybackStateCompat.ACTION_PAUSE |
+                        PlaybackStateCompat.ACTION_PLAY_PAUSE |
+                        PlaybackStateCompat.ACTION_SKIP_TO_NEXT |
+                        PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS |
+                        PlaybackStateCompat.ACTION_SEEK_TO)
+                .setState(state, pos, curPlaying ? 1f : 0f)
+                .build());
+    }
+
+    private Notification buildNotif(Bitmap thumb) {
+        PendingIntent openPi = PendingIntent.getActivity(this, 0,
+                new Intent(this, MainActivity.class).setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        PendingIntent prevPi = mediaPi(ACT_PREV, 10);
+        PendingIntent playPi = mediaPi(curPlaying ? ACT_PAUSE : ACT_PLAY, 11);
+        PendingIntent nextPi = mediaPi(ACT_NEXT, 12);
+
+        NotificationCompat.Builder nb = new NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_media_play)
+                .setContentTitle(curTitle.isEmpty()  ? "SYNC"     : curTitle)
+                .setContentText(curArtist.isEmpty()  ? "재생 중"  : curArtist)
+                .setContentIntent(openPi)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setOnlyAlertOnce(true)
+                .setOngoing(curPlaying)
+                .addAction(android.R.drawable.ic_media_previous, "이전", prevPi)
+                .addAction(curPlaying ? android.R.drawable.ic_media_pause
+                                      : android.R.drawable.ic_media_play,
+                           curPlaying ? "일시정지" : "재생", playPi)
+                .addAction(android.R.drawable.ic_media_next, "다음", nextPi)
+                .setStyle(new MediaStyle()
+                        .setMediaSession(mediaSession.getSessionToken())
+                        .setShowActionsInCompactView(0, 1, 2));
+
+        if (thumb != null) nb.setLargeIcon(thumb);
+        return nb.build();
+    }
+
+    private PendingIntent mediaPi(String action, int req) {
+        Intent i = new Intent(this, MainActivity.class).setAction(action);
+        return PendingIntent.getActivity(this, req, i,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
+
+    // 알림 버튼 → JS
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        if (intent == null || intent.getAction() == null) return;
+        switch (intent.getAction()) {
+            case ACT_PLAY:
+            case ACT_PAUSE: jsCall("togglePlay()"); break;
+            case ACT_NEXT:  jsCall("nextT()");      break;
+            case ACT_PREV:  jsCall("prevT()");      break;
+        }
+    }
+
+    // ════════════════════════════════════════════════════
+    //  썸네일 다운로드
+    // ════════════════════════════════════════════════════
+    private Bitmap loadBitmap(String urlStr) {
+        if (urlStr == null || urlStr.isEmpty()) return null;
+        try {
+            HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
+            c.setConnectTimeout(4000); c.setReadTimeout(4000); c.setDoInput(true); c.connect();
+            InputStream in = c.getInputStream();
+            Bitmap bmp = BitmapFactory.decodeStream(in);
+            in.close(); return bmp;
+        } catch (Exception e) { return null; }
+    }
+
+    // ════════════════════════════════════════════════════
+    //  JS 호출 헬퍼
+    // ════════════════════════════════════════════════════
+    private void jsCall(String js) {
+        runOnUiThread(() -> webView.evaluateJavascript(js, null));
+    }
+
     private void sendToJs(JSONObject payload) {
         String b64 = Base64.encodeToString(
-                payload.toString().getBytes(StandardCharsets.UTF_8),
-                Base64.NO_WRAP);
+                payload.toString().getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
         String js =
             "(function(){" +
-            "  var b=atob('" + b64 + "');" +
-            "  var bytes=new Uint8Array(b.length);" +
-            "  for(var i=0;i<b.length;i++) bytes[i]=b.charCodeAt(i);" +
-            "  var s=new TextDecoder('utf-8').decode(bytes);" +
-            "  window.__sync && window.__sync(s);" +
+            "var b=atob('" + b64 + "');" +
+            "var u=new Uint8Array(b.length);" +
+            "for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);" +
+            "var s=new TextDecoder('utf-8').decode(u);" +
+            "window.__sync&&window.__sync(s);" +
             "})();";
         runOnUiThread(() -> webView.evaluateJavascript(js, null));
     }
 
+    // ════════════════════════════════════════════════════
+    //  화면 회전
+    // ════════════════════════════════════════════════════
     private void setOrientation(String mode) {
         if ("landscape".equals(mode)) {
-            setRequestedOrientation(
-                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
             hideSystemUI();
         } else {
-            setRequestedOrientation(
-                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT);
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT);
             showSystemUI();
         }
     }
@@ -276,10 +404,8 @@ public class MainActivity extends AppCompatActivity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             WindowInsetsController c = getWindow().getInsetsController();
             if (c != null) {
-                c.hide(WindowInsets.Type.statusBars()
-                        | WindowInsets.Type.navigationBars());
-                c.setSystemBarsBehavior(
-                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                c.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
             }
         } else {
             //noinspection deprecation
@@ -297,8 +423,7 @@ public class MainActivity extends AppCompatActivity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             WindowInsetsController c = getWindow().getInsetsController();
             if (c != null)
-                c.show(WindowInsets.Type.statusBars()
-                        | WindowInsets.Type.navigationBars());
+                c.show(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
         } else {
             //noinspection deprecation
             getWindow().getDecorView().setSystemUiVisibility(
@@ -316,34 +441,24 @@ public class MainActivity extends AppCompatActivity {
         String id    = msg.optString("id", "0");
         try {
             String KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-            String URL = "https://www.youtube.com/youtubei/v1/search?key="
-                       + KEY + "&prettyPrint=false";
+            String URL = "https://www.youtube.com/youtubei/v1/search?key=" + KEY + "&prettyPrint=false";
 
             JSONObject client = new JSONObject();
-            client.put("clientName", "WEB");
-            client.put("clientVersion", "2.20240101.00.00");
-            client.put("hl", "ko");
-            client.put("gl", "KR");
-            JSONObject context = new JSONObject();
-            context.put("client", client);
+            client.put("clientName", "WEB"); client.put("clientVersion", "2.20240101.00.00");
+            client.put("hl", "ko"); client.put("gl", "KR");
+            JSONObject context = new JSONObject(); context.put("client", client);
             JSONObject body = new JSONObject();
-            body.put("context", context);
-            body.put("query", query);
-            body.put("params", "EgIQAQ==");
+            body.put("context", context); body.put("query", query); body.put("params", "EgIQAQ==");
 
-            Request req = new Request.Builder()
-                    .url(URL)
-                    .post(RequestBody.create(
-                            body.toString(),
+            Request req = new Request.Builder().url(URL)
+                    .post(RequestBody.create(body.toString(),
                             MediaType.parse("application/json; charset=utf-8")))
                     .addHeader("X-YouTube-Client-Name", "1")
                     .addHeader("X-YouTube-Client-Version", "2.20240101.00.00")
                     .addHeader("Origin", "https://www.youtube.com")
                     .addHeader("Referer", "https://www.youtube.com/")
                     .addHeader("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.8")
-                    .addHeader("User-Agent",
-                            "Mozilla/5.0 (Linux; Android 14) " +
-                            "AppleWebKit/537.36 Chrome/124.0 Safari/537.36")
+                    .addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0 Safari/537.36")
                     .build();
 
             try (Response resp = http.newCall(req).execute()) {
@@ -351,19 +466,15 @@ public class MainActivity extends AppCompatActivity {
                     throw new IOException("HTTP " + resp.code());
                 JSONArray tracks = parseSearchResults(readUtf8(resp));
                 JSONObject result = new JSONObject();
-                result.put("type", "searchResult");
-                result.put("id", id);
-                result.put("success", true);
-                result.put("tracks", tracks);
+                result.put("type", "searchResult"); result.put("id", id);
+                result.put("success", true); result.put("tracks", tracks);
                 sendToJs(result);
             }
         } catch (Exception e) {
             try {
                 JSONObject err = new JSONObject();
-                err.put("type", "searchResult");
-                err.put("id", id);
-                err.put("success", false);
-                err.put("error", e.getMessage());
+                err.put("type", "searchResult"); err.put("id", id);
+                err.put("success", false); err.put("error", e.getMessage());
                 sendToJs(err);
             } catch (JSONException ignored) {}
         }
@@ -373,11 +484,9 @@ public class MainActivity extends AppCompatActivity {
         JSONArray list = new JSONArray();
         JSONObject doc = new JSONObject(json);
         if (!doc.has("contents")) return list;
-
         JSONArray sections;
         try {
-            sections = doc
-                    .getJSONObject("contents")
+            sections = doc.getJSONObject("contents")
                     .getJSONObject("twoColumnSearchResultsRenderer")
                     .getJSONObject("primaryContents")
                     .getJSONObject("sectionListRenderer")
@@ -387,34 +496,23 @@ public class MainActivity extends AppCompatActivity {
         for (int s = 0; s < sections.length() && list.length() < 20; s++) {
             JSONObject sec = sections.getJSONObject(s);
             if (!sec.has("itemSectionRenderer")) continue;
-            JSONArray items = sec.getJSONObject("itemSectionRenderer")
-                               .getJSONArray("contents");
-
+            JSONArray items = sec.getJSONObject("itemSectionRenderer").getJSONArray("contents");
             for (int k = 0; k < items.length() && list.length() < 20; k++) {
                 JSONObject item = items.getJSONObject(k);
                 if (!item.has("videoRenderer")) continue;
                 JSONObject vr = item.getJSONObject("videoRenderer");
                 String vid = vr.optString("videoId", "");
                 if (vid.isEmpty()) continue;
-
                 String title = extractText(vr, "title");
-                String ch = extractText(vr, "ownerText");
+                String ch    = extractText(vr, "ownerText");
                 if (ch.isEmpty()) ch = extractText(vr, "shortBylineText");
-
                 String durStr = "";
-                try {
-                    if (vr.has("lengthText"))
-                        durStr = vr.getJSONObject("lengthText").optString("simpleText", "");
-                } catch (JSONException ignored2) {}
-
+                try { if (vr.has("lengthText")) durStr = vr.getJSONObject("lengthText").optString("simpleText", ""); }
+                catch (JSONException ignored2) {}
                 int dur = parseDur(durStr);
                 if (!isMusicVideo(title, ch, dur)) continue;
-
                 JSONObject t = new JSONObject();
-                t.put("id", vid);
-                t.put("title", title);
-                t.put("channel", ch);
-                t.put("dur", dur);
+                t.put("id", vid); t.put("title", title); t.put("channel", ch); t.put("dur", dur);
                 t.put("thumb", "https://i.ytimg.com/vi/" + vid + "/mqdefault.jpg");
                 list.put(t);
             }
@@ -426,8 +524,7 @@ public class MainActivity extends AppCompatActivity {
         try {
             if (!vr.has(key)) return "";
             JSONObject obj = vr.getJSONObject(key);
-            if (obj.has("runs"))
-                return obj.getJSONArray("runs").getJSONObject(0).optString("text", "");
+            if (obj.has("runs")) return obj.getJSONArray("runs").getJSONObject(0).optString("text", "");
             return obj.optString("simpleText", "");
         } catch (JSONException e) { return ""; }
     }
@@ -436,24 +533,17 @@ public class MainActivity extends AppCompatActivity {
         if (s == null || s.isEmpty()) return 0;
         String[] p = s.split(":");
         try {
-            if (p.length == 3) return Integer.parseInt(p[0]) * 3600
-                    + Integer.parseInt(p[1]) * 60 + Integer.parseInt(p[2]);
-            if (p.length == 2) return Integer.parseInt(p[0]) * 60
-                    + Integer.parseInt(p[1]);
+            if (p.length == 3) return Integer.parseInt(p[0]) * 3600 + Integer.parseInt(p[1]) * 60 + Integer.parseInt(p[2]);
+            if (p.length == 2) return Integer.parseInt(p[0]) * 60 + Integer.parseInt(p[1]);
         } catch (NumberFormatException ignored) {}
         return 0;
     }
 
     private boolean isMusicVideo(String title, String channel, int durSec) {
         String tl = title.toLowerCase(), cl = channel.toLowerCase();
-        for (String kw : new String[]{
-                "vevo","topic","music","records","entertainment",
-                "sound","audio","official","label","studio"})
+        for (String kw : new String[]{"vevo","topic","music","records","entertainment","sound","audio","official","label","studio"})
             if (cl.contains(kw)) return true;
-        for (String kw : new String[]{
-                "official","mv","m/v","music video","audio","lyrics",
-                "lyric","visualizer","live","performance","concert","feat",
-                "뮤직비디오","음원","공식","노래"})
+        for (String kw : new String[]{"official","mv","m/v","music video","audio","lyrics","lyric","visualizer","live","performance","concert","feat","뮤직비디오","음원","공식","노래"})
             if (tl.contains(kw)) return true;
         return durSec >= 60 || durSec == 0;
     }
@@ -465,43 +555,34 @@ public class MainActivity extends AppCompatActivity {
         String query = msg.optString("query");
         String id    = msg.optString("id", "0");
         try {
-            String url = "https://suggestqueries.google.com/complete/search"
-                    + "?client=firefox&ds=yt&q="
+            String url = "https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q="
                     + java.net.URLEncoder.encode(query, "UTF-8") + "&hl=ko";
             Request req = new Request.Builder().url(url)
-                    .addHeader("User-Agent", "Mozilla/5.0 Firefox/124.0")
-                    .build();
+                    .addHeader("User-Agent", "Mozilla/5.0 Firefox/124.0").build();
             try (Response resp = http.newCall(req).execute()) {
                 if (resp.body() == null) throw new IOException("empty");
                 String json = readUtf8(resp);
                 if (json.startsWith("window."))
-                    json = json.replaceFirst("^[^(]+\\(", "")
-                               .replaceFirst("\\)\\s*$", "");
-                JSONArray arr  = new JSONArray(json);
-                JSONArray sugs = new JSONArray();
+                    json = json.replaceFirst("^[^(]+\\(", "").replaceFirst("\\)\\s*$", "");
+                JSONArray arr = new JSONArray(json), sugs = new JSONArray();
                 if (arr.length() > 1) {
                     JSONArray inner = arr.getJSONArray(1);
                     for (int i = 0; i < inner.length() && sugs.length() < 8; i++) {
                         Object o = inner.get(i);
-                        String sv = (o instanceof JSONArray)
-                                ? ((JSONArray) o).optString(0, "") : o.toString();
+                        String sv = (o instanceof JSONArray) ? ((JSONArray) o).optString(0, "") : o.toString();
                         if (!sv.isEmpty()) sugs.put(sv);
                     }
                 }
                 JSONObject result = new JSONObject();
-                result.put("type", "suggestResult");
-                result.put("id", id);
-                result.put("success", true);
-                result.put("suggestions", sugs);
+                result.put("type", "suggestResult"); result.put("id", id);
+                result.put("success", true); result.put("suggestions", sugs);
                 sendToJs(result);
             }
         } catch (Exception e) {
             try {
                 JSONObject err = new JSONObject();
-                err.put("type", "suggestResult");
-                err.put("id", id);
-                err.put("success", false);
-                err.put("suggestions", new JSONArray());
+                err.put("type", "suggestResult"); err.put("id", id);
+                err.put("success", false); err.put("suggestions", new JSONArray());
                 sendToJs(err);
             } catch (JSONException ignored) {}
         }
@@ -515,40 +596,25 @@ public class MainActivity extends AppCompatActivity {
         String channel  = msg.optString("channel");
         double dur      = msg.optDouble("duration", 0);
         String id       = msg.optString("id", "0");
-
         JSONArray lines = tryLrclib(rawTitle, channel, dur);
         if (lines == null) lines = tryNetEase(rawTitle, channel, dur);
-
         try {
             JSONObject result = new JSONObject();
-            result.put("type", "lyricsResult");
-            result.put("id", id);
-            if (lines != null) {
-                result.put("success", true);
-                result.put("lines", lines);
-            } else {
-                result.put("success", false);
-                result.put("lines", new JSONArray());
-            }
+            result.put("type", "lyricsResult"); result.put("id", id);
+            if (lines != null) { result.put("success", true);  result.put("lines", lines); }
+            else               { result.put("success", false); result.put("lines", new JSONArray()); }
             sendToJs(result);
         } catch (JSONException ignored) {}
     }
 
-    // ════════════════════════════════════════════════════
-    //  1차: lrclib.net
-    // ════════════════════════════════════════════════════
     private JSONArray tryLrclib(String rawTitle, String channel, double ytDur) {
         try {
-            String ct = cleanTitle(rawTitle);
-            String ca = cleanArtist(channel);
-            String stripped = stripBrackets(ct);
+            String ct = cleanTitle(rawTitle), ca = cleanArtist(channel), stripped = stripBrackets(ct);
             List<String> queries = new ArrayList<>();
-            queries.add(ct + " " + ca);
-            queries.add(ct);
+            queries.add(ct + " " + ca); queries.add(ct);
             if (!stripped.equals(ct)) queries.add(stripped);
             if (!ca.isEmpty()) queries.add(ca + " " + ct);
             if (!ca.isEmpty() && !stripped.equals(ct)) queries.add(stripped + " " + ca);
-
             JSONArray results = new JSONArray();
             for (String q : queries) {
                 JSONArray r = searchLrclib(q);
@@ -556,32 +622,23 @@ public class MainActivity extends AppCompatActivity {
                 if (results.length() == 0 && r.length() > 0) results = r;
             }
             if (results.length() == 0) return null;
-
-            String bestLrc   = null;
-            double bestScore = Double.NEGATIVE_INFINITY;
-
+            String bestLrc = null; double bestScore = Double.NEGATIVE_INFINITY;
             for (int i = 0; i < results.length(); i++) {
                 JSONObject item = results.getJSONObject(i);
                 String lrcText = item.optString("syncedLyrics", "");
                 if (lrcText.isEmpty()) lrcText = item.optString("plainLyrics", "");
                 if (lrcText.isEmpty()) continue;
-
                 double lrcDur = getLrcLastTimestamp(lrcText);
                 if (lrcDur <= 0) lrcDur = item.optDouble("duration", 0);
-
                 double score = 0;
                 if (ytDur > 0 && lrcDur > 0) {
                     double diff = Math.abs(lrcDur - ytDur);
-                    if      (diff <= 3)  score += 50;
-                    else if (diff <= 10) score += 35;
-                    else if (diff <= 30) score += 15;
-                    else if (diff <= 60) score += 5;
-                    else                 score -= 25;
+                    if (diff <= 3) score += 50; else if (diff <= 10) score += 35;
+                    else if (diff <= 30) score += 15; else if (diff <= 60) score += 5; else score -= 25;
                 }
                 score += titleSim(ct, item.optString("trackName",  "")) * 30;
                 score += titleSim(ca, item.optString("artistName", "")) * 20;
                 if (!item.optString("syncedLyrics", "").isEmpty()) score += 10;
-
                 if (score > bestScore) { bestScore = score; bestLrc = lrcText; }
             }
             return bestLrc != null ? parseLrc(bestLrc) : null;
@@ -590,12 +647,10 @@ public class MainActivity extends AppCompatActivity {
 
     private JSONArray searchLrclib(String query) {
         try {
-            String url = "https://lrclib.net/api/search?q="
-                    + java.net.URLEncoder.encode(query, "UTF-8");
+            String url = "https://lrclib.net/api/search?q=" + java.net.URLEncoder.encode(query, "UTF-8");
             Request req = new Request.Builder().url(url)
-                    .addHeader("User-Agent", "SYNCApp/1.0 (https://github.com/sync)")
-                    .addHeader("Accept", "application/json")
-                    .build();
+                    .addHeader("User-Agent", "SYNCApp/1.0")
+                    .addHeader("Accept", "application/json").build();
             try (Response resp = http.newCall(req).execute()) {
                 if (resp.body() == null) return new JSONArray();
                 Object parsed = new org.json.JSONTokener(readUtf8(resp)).nextValue();
@@ -606,44 +661,29 @@ public class MainActivity extends AppCompatActivity {
 
     private boolean hasSyncedResults(JSONArray arr) {
         if (arr == null) return false;
-        try {
-            for (int i = 0; i < arr.length(); i++)
-                if (!arr.getJSONObject(i).optString("syncedLyrics", "").isEmpty())
-                    return true;
-        } catch (JSONException ignored) {}
+        try { for (int i = 0; i < arr.length(); i++) if (!arr.getJSONObject(i).optString("syncedLyrics", "").isEmpty()) return true; }
+        catch (JSONException ignored) {}
         return false;
     }
 
-    // ════════════════════════════════════════════════════
-    //  2차: NetEase Cloud Music
-    // ════════════════════════════════════════════════════
     private JSONArray tryNetEase(String rawTitle, String channel, double ytDur) {
         try {
-            String ct = cleanTitle(rawTitle);
-            String ca = cleanArtist(channel);
-            String stripped = stripBrackets(ct);
+            String ct = cleanTitle(rawTitle), ca = cleanArtist(channel), stripped = stripBrackets(ct);
             List<String> queryList = new ArrayList<>();
-            queryList.add(ct + " " + ca);
-            queryList.add(ct);
+            queryList.add(ct + " " + ca); queryList.add(ct);
             if (!stripped.equals(ct)) queryList.add(stripped);
             if (!ca.isEmpty()) queryList.add(ca + " " + ct);
-
-            List<long[]>  ids    = new ArrayList<>();
-            List<Double>  scores = new ArrayList<>();
-
+            List<long[]> ids = new ArrayList<>(); List<Double> scores = new ArrayList<>();
             for (String q : queryList) {
-                List<long[]>  tmpIds    = new ArrayList<>();
-                List<Double>  tmpScores = new ArrayList<>();
-                searchNetEase(q, ct, ca, ytDur, tmpIds, tmpScores);
-                if (!tmpIds.isEmpty()) { ids = tmpIds; scores = tmpScores; break; }
+                List<long[]> ti = new ArrayList<>(); List<Double> ts = new ArrayList<>();
+                searchNetEase(q, ct, ca, ytDur, ti, ts);
+                if (!ti.isEmpty()) { ids = ti; scores = ts; break; }
             }
             if (ids.isEmpty()) return null;
-
             Integer[] idx = new Integer[ids.size()];
             for (int i = 0; i < idx.length; i++) idx[i] = i;
             final List<Double> fs = scores;
             Arrays.sort(idx, (a, b) -> Double.compare(fs.get(b), fs.get(a)));
-
             for (int i = 0; i < Math.min(5, idx.length); i++) {
                 if (fs.get(idx[i]) < 20) break;
                 JSONArray lines = fetchNetEaseLrc(ids.get(idx[i])[0]);
@@ -657,13 +697,11 @@ public class MainActivity extends AppCompatActivity {
             double ytDur, List<long[]> ids, List<Double> scores) {
         try {
             String url = "https://music.163.com/api/search/get?s="
-                    + java.net.URLEncoder.encode(query, "UTF-8")
-                    + "&type=1&limit=10";
+                    + java.net.URLEncoder.encode(query, "UTF-8") + "&type=1&limit=10";
             Request req = new Request.Builder().url(url)
                     .addHeader("Referer", "https://music.163.com")
                     .addHeader("Cookie",  "appver=8.0.0")
-                    .addHeader("User-Agent", "Mozilla/5.0")
-                    .build();
+                    .addHeader("User-Agent", "Mozilla/5.0").build();
             try (Response resp = http.newCall(req).execute()) {
                 if (resp.body() == null) return;
                 JSONObject doc = new JSONObject(readUtf8(resp));
@@ -672,26 +710,19 @@ public class MainActivity extends AppCompatActivity {
                 if (songs == null) return;
                 for (int i = 0; i < songs.length(); i++) {
                     JSONObject song = songs.getJSONObject(i);
-                    long   sid      = song.optLong("id");
-                    String st       = song.optString("name", "");
+                    long sid = song.optLong("id"); String st = song.optString("name", "");
                     double duration = song.optDouble("duration", 0) / 1000.0;
                     StringBuilder ab = new StringBuilder();
                     JSONArray art = song.optJSONArray("artists");
-                    if (art != null)
-                        for (int j = 0; j < art.length(); j++)
-                            ab.append(art.getJSONObject(j).optString("name",""))
-                              .append(" ");
-                    double score = titleSim(ct, st) * 40
-                                 + titleSim(ca, ab.toString().trim()) * 25;
+                    if (art != null) for (int j = 0; j < art.length(); j++)
+                        ab.append(art.getJSONObject(j).optString("name", "")).append(" ");
+                    double score = titleSim(ct, st) * 40 + titleSim(ca, ab.toString().trim()) * 25;
                     if (ytDur > 0 && duration > 0) {
                         double diff = Math.abs(duration - ytDur);
-                        if      (diff <= 3)  score += 30;
-                        else if (diff <= 10) score += 18;
-                        else if (diff <= 30) score += 8;
-                        else                 score -= 15;
+                        if (diff <= 3) score += 30; else if (diff <= 10) score += 18;
+                        else if (diff <= 30) score += 8; else score -= 15;
                     }
-                    ids.add(new long[]{sid});
-                    scores.add(score);
+                    ids.add(new long[]{sid}); scores.add(score);
                 }
             }
         } catch (Exception ignored) {}
@@ -699,21 +730,17 @@ public class MainActivity extends AppCompatActivity {
 
     private JSONArray fetchNetEaseLrc(long songId) {
         try {
-            String url = "https://music.163.com/api/song/lyric?id="
-                    + songId + "&lv=1&kv=1&tv=-1";
+            String url = "https://music.163.com/api/song/lyric?id=" + songId + "&lv=1&kv=1&tv=-1";
             Request req = new Request.Builder().url(url)
                     .addHeader("Referer", "https://music.163.com")
-                    .addHeader("Cookie",  "appver=8.0.0")
-                    .build();
+                    .addHeader("Cookie",  "appver=8.0.0").build();
             try (Response resp = http.newCall(req).execute()) {
                 if (resp.body() == null) return null;
                 JSONObject doc = new JSONObject(readUtf8(resp));
                 String lrc = null;
-                if (doc.has("klyric"))
-                    lrc = doc.getJSONObject("klyric").optString("lyric", null);
+                if (doc.has("klyric")) lrc = doc.getJSONObject("klyric").optString("lyric", null);
                 if (lrc == null || lrc.isEmpty())
-                    if (doc.has("lrc"))
-                        lrc = doc.getJSONObject("lrc").optString("lyric", null);
+                    if (doc.has("lrc")) lrc = doc.getJSONObject("lrc").optString("lyric", null);
                 return (lrc != null && !lrc.isEmpty()) ? parseLrc(lrc) : null;
             }
         } catch (Exception e) { return null; }
@@ -723,52 +750,34 @@ public class MainActivity extends AppCompatActivity {
     //  LRC 파서
     // ════════════════════════════════════════════════════
     private static final Pattern CREDIT_RX = Pattern.compile(
-            "^\\s*(?:作词|作曲|编曲|混音|制作人|出品|录音|母带" +
-            "|OP|SP|厂牌|发行|监制|制作|ISRC|专辑|歌手)\\s*[：:].{0,80}$");
-
+            "^\\s*(?:作词|作曲|编曲|混音|制作人|出品|录音|母带|OP|SP|厂牌|发行|监制|制作|ISRC|专辑|歌手)\\s*[：:].{0,80}$");
     private static final Pattern TS_RX = Pattern.compile(
             "\\[(\\d+):(\\d{2})[.:](\\d{2,3})\\]");
 
     private JSONArray parseLrc(String lrc) throws JSONException {
-        List<double[]> times = new ArrayList<>();
-        List<String>   texts = new ArrayList<>();
-
+        List<double[]> times = new ArrayList<>(); List<String> texts = new ArrayList<>();
         for (String line : lrc.split("\n")) {
             String trimmed = line.trim();
-            String textPart = trimmed
-                    .replaceAll("\\[\\d+:\\d{2}[.:]\\d{2,3}\\]", "").trim();
-            if (textPart.isEmpty() || CREDIT_RX.matcher(textPart).matches())
-                continue;
-
+            String textPart = trimmed.replaceAll("\\[\\d+:\\d{2}[.:]\\d{2,3}\\]", "").trim();
+            if (textPart.isEmpty() || CREDIT_RX.matcher(textPart).matches()) continue;
             Matcher scanner = TS_RX.matcher(trimmed);
             while (scanner.find()) {
                 String msStr = scanner.group(3);
-                double ms = msStr.length() == 2
-                        ? Integer.parseInt(msStr) / 100.0
-                        : Integer.parseInt(msStr) / 1000.0;
-                double t = Integer.parseInt(scanner.group(1)) * 60.0
-                         + Integer.parseInt(scanner.group(2)) + ms;
-                times.add(new double[]{t});
-                texts.add(textPart);
+                double ms = msStr.length() == 2 ? Integer.parseInt(msStr) / 100.0 : Integer.parseInt(msStr) / 1000.0;
+                double t = Integer.parseInt(scanner.group(1)) * 60.0 + Integer.parseInt(scanner.group(2)) + ms;
+                times.add(new double[]{t}); texts.add(textPart);
             }
         }
-
         Integer[] idx = new Integer[times.size()];
         for (int i = 0; i < idx.length; i++) idx[i] = i;
-        Arrays.sort(idx, (a, b) ->
-                Double.compare(times.get(a)[0], times.get(b)[0]));
-
+        Arrays.sort(idx, (a, b) -> Double.compare(times.get(a)[0], times.get(b)[0]));
         JSONArray result = new JSONArray();
         for (int i = 0; i < idx.length; i++) {
-            int    ci    = idx[i];
-            double start = times.get(ci)[0];
-            double end   = (i + 1 < idx.length)
-                    ? times.get(idx[i + 1])[0] : start + 5.0;
+            int ci = idx[i]; double start = times.get(ci)[0];
+            double end = (i + 1 < idx.length) ? times.get(idx[i + 1])[0] : start + 5.0;
             if (end - start < 0.1) end = start + 0.5;
             JSONObject obj = new JSONObject();
-            obj.put("start", start);
-            obj.put("end",   end);
-            obj.put("text",  texts.get(ci));
+            obj.put("start", start); obj.put("end", end); obj.put("text", texts.get(ci));
             result.put(obj);
         }
         return result;
@@ -792,8 +801,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private String stripBrackets(String t) {
-        return t.replaceAll("\\([^)]*\\)", "")
-                .replaceAll("\\[[^\\]]*\\]", "")
+        return t.replaceAll("\\([^)]*\\)", "").replaceAll("\\[[^\\]]*\\]", "")
                 .replaceAll("\\s{2,}", " ").trim();
     }
 
@@ -803,11 +811,8 @@ public class MainActivity extends AppCompatActivity {
             Matcher m = TS_RX.matcher(line.trim());
             while (m.find()) {
                 String msStr = m.group(3);
-                double ms = msStr.length() == 2
-                        ? Integer.parseInt(msStr) / 100.0
-                        : Integer.parseInt(msStr) / 1000.0;
-                double t = Integer.parseInt(m.group(1)) * 60.0
-                         + Integer.parseInt(m.group(2)) + ms;
+                double ms = msStr.length() == 2 ? Integer.parseInt(msStr) / 100.0 : Integer.parseInt(msStr) / 1000.0;
+                double t = Integer.parseInt(m.group(1)) * 60.0 + Integer.parseInt(m.group(2)) + ms;
                 if (t > last) last = t;
             }
         }
@@ -816,36 +821,30 @@ public class MainActivity extends AppCompatActivity {
 
     private String cleanTitle(String t) {
         final String TAG_RX =
-            "(?i)official\\s*(?:music\\s*)?(?:video|audio|mv|lyric(?:s)?|visualizer)?" +
-            "|\\bm/?v\\b" +
-            "|\\bmusic\\s*video\\b" +
-            "|\\baudio(?:\\s*only)?\\b" +
-            "|\\blyrics?(?:\\s*(?:video|ver(?:sion)?))?\\b" +
-            "|\\bvisualizer\\b" +
-            "|\\blive(?:\\s+(?:performance|version|session))?\\b" +
-            "|\\bperformance(?:\\s+video)?\\b" +
-            "|\\b(?:hd|4k|1080p|720p)\\b" +
-            "|\\bremaster(?:ed)?(?:\\s+version)?\\b" +
-            "|\\bre-?upload\\b" +
+            "(?i)official\\s*(?:music\\s*)?(?:video|audio|mv|lyric(?:s)?|visualizer)?|\\bm/?v\\b" +
+            "|\\bmusic\\s*video\\b|\\baudio(?:\\s*only)?\\b|\\blyrics?(?:\\s*(?:video|ver(?:sion)?))?\\b" +
+            "|\\bvisualizer\\b|\\blive(?:\\s+(?:performance|version|session))?\\b" +
+            "|\\bperformance(?:\\s+video)?\\b|\\b(?:hd|4k|1080p|720p)\\b" +
+            "|\\bremaster(?:ed)?(?:\\s+version)?\\b|\\bre-?upload\\b" +
             "|\\beng(?:lish)?\\s*(?:ver\\.?|version|sub(?:title)?s?)?\\b" +
-            "|\\bkor(?:ean)?\\s*(?:ver\\.?|version)?\\b" +
-            "|\\bjp(?:n)?\\s*(?:ver\\.?|version)?\\b";
-
+            "|\\bkor(?:ean)?\\s*(?:ver\\.?|version)?\\b|\\bjp(?:n)?\\s*(?:ver\\.?|version)?\\b";
         t = t.replaceAll("\\(\\s*(?:" + TAG_RX + ")[^)]*\\)", "").trim();
         t = t.replaceAll("\\[\\s*(?:" + TAG_RX + ")[^\\]]*\\]", "").trim();
         t = t.replaceAll("(?i)\\s*[-|]\\s*(?:" + TAG_RX + ")\\s*$", "").trim();
         t = t.replaceAll("(?i)\\s+(?:feat\\.?|ft\\.?)\\s+.+$", "").trim();
-        t = t.replaceAll("[\\u2013\\u2014]+", "-").trim();
+        t = t.replaceAll("[\\u2013\\u2014]+", " - ").trim();
         return t.replaceAll("\\s{2,}", " ").trim();
     }
 
     private String cleanArtist(String c) {
         c = c.replaceAll("(?i)\\s*[-–]\\s*Topic\\s*$", "").trim();
         c = c.replaceAll("(?i)VEVO$", "").trim();
-        c = c.replaceAll(
-                "(?i)\\s*(?:Records|Entertainment|Music|Official|Label|Studios?)\\s*$",
-                "").trim();
+        c = c.replaceAll("(?i)\\s*(?:Records|Entertainment|Music|Official|Label|Studios?)\\s*$", "").trim();
         return c.replaceAll("\\s{2,}", " ").trim();
+    }
+
+    private String readUtf8(Response resp) throws IOException {
+        return new String(resp.body().bytes(), StandardCharsets.UTF_8);
     }
 
     // ════════════════════════════════════════════════════
@@ -854,8 +853,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onPause() {
         super.onPause();
-        // ★ 의도적으로 webView.onPause() 호출 안 함
-        //    → JS 엔진 & YouTube IFrame 백그라운드 유지
+        // ★ webView.onPause() 호출 금지 → JS/YouTube 백그라운드 유지
     }
 
     @Override
@@ -868,9 +866,9 @@ public class MainActivity extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         executor.shutdown();
-        if (serviceBound) {
-            unbindService(serviceConn);
-            serviceBound = false;
+        if (mediaSession != null) {
+            mediaSession.setActive(false);
+            mediaSession.release();
         }
         webView.destroy();
     }
@@ -878,11 +876,6 @@ public class MainActivity extends AppCompatActivity {
     @Override
     public void onBackPressed() {
         webView.evaluateJavascript(
-                "window.__onAndroidBack && window.__onAndroidBack()", null);
-    }
-
-    private String readUtf8(Response resp) throws IOException {
-        byte[] bytes = resp.body().bytes();
-        return new String(bytes, StandardCharsets.UTF_8);
+                "window.__onAndroidBack&&window.__onAndroidBack()", null);
     }
 }
