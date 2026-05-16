@@ -807,6 +807,18 @@ function onYtSt(e) {
         document.getElementById('np-pulse').style.display = 'block';
         if (S.echo > 0) setEcho(S.echo);
         startBeatTimer((MOODS[_curMood] || MOODS.default).bpm);
+               post('playState', { playing: true });
+        // 트랙 정보도 함께 업데이트 (duration 확정 후)
+        setTimeout(() => {
+            const dur = S.ytPlayer ? S.ytPlayer.getDuration() || 0 : 0;
+            if (S.track) post('trackInfo', {
+                title:    S.track.title,
+                artist:   S.track.channel || 'YouTube',
+                thumb:    getThumbMd(S.track.id),
+                playing:  true,
+                duration: dur
+            });
+        }, 500);
     } else if (e.data === P.PAUSED) {
         S.playing = false; BG.playing = false; updPlay(); stopTick(); stopBeatTimer();
         document.getElementById('vizz').classList.add('off');
@@ -814,11 +826,13 @@ function onYtSt(e) {
         document.getElementById('np-ash').classList.remove('playing');
         document.getElementById('np-pulse').style.display = 'none';
         clearInterval(_echoTimer);
+        post('playState', { playing: false });
     } else if (e.data === P.ENDED) {
         clearInterval(_echoTimer); stopBeatTimer();
         if (S.repeat === 2) { S.ytPlayer.seekTo(0); S.ytPlayer.playVideo(); }
         else if (S.repeat === 1 || S.idx < S.q.length - 1) nextT();
         else { S.playing = false; BG.playing = false; updPlay(); stopTick(); }
+        post('playState', { playing: false });
     }
 }
 function onYtErr() { toast('⚠️ 재생 불가 — 다음 곡으로 이동합니다'); setTimeout(nextT, 1200); }
@@ -992,6 +1006,14 @@ function playTrack(t, idx = -1) {
     });
     detectMood(t.title);
     extractThumbColors(hq, md, t.title);
+    // 서비스에 트랙 정보 전달
+    post('trackInfo', {
+        title:    t.title,
+        artist:   t.channel || 'YouTube',
+        thumb:    getThumbMd(t.id),
+        playing:  true,
+        duration: S.dur || 0
+    });
     post('setTitle', { title: t.title });
     renderQueue(); openNP();
     toast(`▶  ${t.title.length > 44 ? t.title.slice(0, 44) + '…' : t.title}`);
@@ -1135,6 +1157,9 @@ function startTick() {
             if (OV.active && !ovb?.classList.contains('dragging')) ovb?._setFill?.(pct);
             setT('p-cur', S.cur); setT('np-cur', S.cur);
             setT('p-tot', S.dur); setT('np-tot', S.dur);
+            if (S.ticker && Math.round(S.cur) % 5 === 0) {
+                   post('seekPosition', { position: S.cur });
+            }
             if (OV.active) { setT('ov-p-cur', S.cur); setT('ov-p-tot', S.dur); }
             const bpf = document.getElementById('bar-prog-fill');
             if (bpf) bpf.style.width = pct.toFixed(2) + '%';
